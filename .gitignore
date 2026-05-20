@@ -1,0 +1,14 @@
+# Environment variables (contains sensitive secrets)
+.env
+
+# Generated reports
+reports/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS files
+.DS_Store
+Thumbs.db
