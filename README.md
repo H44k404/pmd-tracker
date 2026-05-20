@@ -14,6 +14,7 @@ The tool queries public Facebook posts, retrieves all reactions and comments, an
   - **Sheet 1: "Engagement Summary"** – Aggregates metadata per post, including total staff, engaged count, missed count, active clickable hyperlinks, and wrapped, sorted lists of names.
   - **Sheet 2: "Staff Breakdown"** – Plots each staff member's engagement status (`✅ Reacted` or `❌ Not Reacted`) against each post with total engagement tallies.
 - **High-Fidelity Demo Mode**: Runs out-of-the-box without a Facebook token. Generates deterministic mock engagement data seeded with `42` to verify formatting and layout instantly.
+- **Super Admin Roster Manager Dashboard**: A built-in local desktop application (`admin_dashboard.py`) to easily search, view, add, and delete staff members from `staff.json` using an elegant GUI without touching raw files.
 - **Robust API Engine**: Automatically handles Facebook Graph API limit restrictions and cursor-based pagination (`paging.next`) to scale seamlessly.
 - **Data Privacy**: Kept local. Sensitive environment tokens and generated reports are protected from leaks using `.gitignore`.
 
@@ -35,7 +36,8 @@ The tool queries public Facebook posts, retrieves all reactions and comments, an
 
 ```
 pmd-tracker/
-├── tracker.py        ← Main executable Python script
+├── tracker.py        ← Main executable Python script (audits engagement)
+├── admin_dashboard.py ← Desktop Admin GUI (manages staff list)
 ├── staff.json        ← Roster of PMD staff + Facebook display names
 ├── posts.json        ← Queue of Facebook posts to track
 ├── .env              ← Environment variables (Page Access Token)
@@ -114,6 +116,22 @@ Open the generated spreadsheet:
 ```bash
 libreoffice reports/PMD_Engagement_Report_*.xlsx
 ```
+
+---
+
+## 🖥️ Launching the Admin Dashboard
+
+Instead of editing `staff.json` manually, launch the desktop GUI to easily manage your staff directory:
+```bash
+python3 admin_dashboard.py
+```
+*Features:*
+- **Search bar** to filter staff in real-time.
+- **Input fields** with active validation to add new staff.
+- **Visual department dropdown** selections.
+- **Action button** to quickly delete a selected member with confirmation.
+- **Automatic instant saving** directly to `staff.json`.
+- **Live statistics** visual display.
 
 ---
 
