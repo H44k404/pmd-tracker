@@ -9,9 +9,11 @@ Description: A lightweight Python tool for the President Media Division (PMD)
 import os
 import json
 import random
+import re
 import time
 import datetime
 import requests
+import difflib
 from dotenv import load_dotenv
 
 # Openpyxl for styled Excel report generation
@@ -21,6 +23,49 @@ from openpyxl.utils import get_column_letter
 
 # Load environment variables
 load_dotenv()
+
+
+def validate_facebook_token(access_token):
+    """Validate the provided Facebook access token.
+    Returns a dict with keys:
+      - ok: bool
+      - error: optional error message
+      - data: optional dict with 'me' and 'pages' information
+    """
+    if not access_token:
+        return {"ok": False, "error": "No access token provided"}
+
+    base = "https://graph.facebook.com/v25.0"
+    try:
+        # Basic token test: /me
+        r_me = requests.get(f"{base}/me", params={"access_token": access_token}, timeout=15)
+        if r_me.status_code != 200:
+            try:
+                err = r_me.json().get("error", {}).get("message", r_me.text)
+            except Exception:
+                err = r_me.text
+            return {"ok": False, "error": f"/me failed: {err}"}
+
+        me = r_me.json()
+
+        # Try /me/accounts to see if this user token can list pages (and obtain page tokens)
+        r_pages = requests.get(f"{base}/me/accounts", params={"access_token": access_token}, timeout=15)
+        pages = []
+        if r_pages.status_code == 200:
+            pages = r_pages.json().get("data", [])
+        else:
+            # If pages endpoint fails, capture message but still return user info
+            try:
+                pages_err = r_pages.json().get("error", {}).get("message", r_pages.text)
+            except Exception:
+                pages_err = r_pages.text
+            pages = {"error": pages_err}
+
+        return {"ok": True, "data": {"me": me, "pages": pages}}
+
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "error": f"Request failed: {e}"}
+
 
 def print_header():
     print("=======================================================")
@@ -64,50 +109,93 @@ def load_json_files():
 
     return staff_list, posts_list
 
+def normalize_name(value):
+    """Normalize Facebook names for consistent matching."""
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def find_best_reactor_match(fb_name, reactors, min_ratio=0.75):
+    """Find best matching reactor key for a staff facebook name.
+    reactors: dict mapping normalized_name -> {original, type}
+    Returns the reactor key (normalized) if a match is found, else None.
+    Matching strategy:
+      1. Exact normalized match
+      2. Substring containment (either direction)
+      3. Fuzzy ratio (difflib.SequenceMatcher) >= min_ratio
+    """
+    if not fb_name or not reactors:
+        return None
+
+    target = normalize_name(fb_name)
+    # exact
+    if target in reactors:
+        return target
+
+    keys = list(reactors.keys())
+
+    # substring matches
+    for k in keys:
+        if target in k or k in target:
+            return k
+
+    # fuzzy matching
+    best_key = None
+    best_ratio = 0.0
+    for k in keys:
+        ratio = difflib.SequenceMatcher(None, target, k).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_key = k
+
+    if best_ratio >= min_ratio:
+        return best_key
+
+    return None
+
+
 def get_facebook_reactions(post_id, access_token):
     """
-    Fetches all reactors' names on a post using Facebook Graph API.
-    Handles pagination. Returns a set of reactor names.
+    Fetches all reactors' names and their reaction types on a post using Facebook Graph API.
+    Returns a dict mapping normalized Facebook name -> (original_name, reaction_type), or
+    an auth error object with {'auth_error': True, 'message': ...} when the token is invalid.
     """
-    reactors = set()
+    reactors = {}  # key: normalized name, value: (original_name, reaction_type)
     url = f"https://graph.facebook.com/v19.0/{post_id}/reactions"
     params = {
-        "fields": "name,id",
+        "fields": "name,type",
         "access_token": access_token,
         "limit": 500
     }
-    
     while url:
         try:
-            # For the first call, we pass params. For subsequent paginated calls, 
-            # url already contains access_token and query parameters.
-            response = requests.get(
-                url, 
-                params=params if url.endswith("/reactions") else None, 
-                timeout=30
-            )
-            
+            response = requests.get(url, params=params if url.endswith("/reactions") else None, timeout=30)
             if response.status_code != 200:
-                error_msg = response.json().get("error", {}).get("message", "Unknown error")
-                print(f"\n  ❌ Facebook Graph API Error (Reactions for post {post_id}): {error_msg}")
+                error_data = response.json().get("error", {})
+                error_msg = error_data.get("message", "Unknown error")
+                error_code = error_data.get("code")
+                print(f"\n  ❌  Facebook Graph API Error (Reactions for post {post_id}): {error_msg}")
+                if error_code == 190 or "access token" in error_msg.lower():
+                    return {"auth_error": True, "message": error_msg}
+                if "unsupported get request" in error_msg.lower() or "missing permissions" in error_msg.lower():
+                    return {"unsupported_error": True, "message": error_msg}
                 return None
-                
             data = response.json()
             for item in data.get("data", []):
-                # Skip reaction silently if name is missing
-                name = item.get("name")
+                name = item.get("name", "").strip()
+                r_type = item.get("type") or "UNKNOWN"
                 if name:
-                    reactors.add(name)
-                    
-            # Get next page URL
+                    # Store with normalized key for case-insensitive matching
+                    reactors[normalize_name(name)] = {"original": name, "type": r_type}
             url = data.get("paging", {}).get("next")
             params = None
-            
         except Exception as e:
-            print(f"\n  ❌ Exception while fetching reactions for post {post_id}: {e}")
+            print(f"\n  ❌  Exception while fetching reactions for post {post_id}: {e}")
             return None
-            
+    print(f"    ℹ️  Total reactors found: {len(reactors)}")
     return reactors
+
 
 def get_facebook_comments(post_id, access_token):
     """
@@ -153,6 +241,43 @@ def get_facebook_comments(post_id, access_token):
             return None
             
     return commentators
+
+def build_demo_engagement(staff_list, posts_list):
+    """Generate a reproducible demo engagement data set for all posts."""
+    random.seed(42)
+    rates = [0.28, 0.19, 0.36, 0.22, 0.31]
+    possible_reacts = ["LIKE", "LOVE", "CARE", "HAHA", "WOW", "SAD", "ANGRY"]
+    engagement_data = {}
+
+    for i, post in enumerate(posts_list):
+        rate = rates[i % len(rates)]
+        engaged_staff = []
+        missed_staff = []
+        fb_engaged_set = set()
+        reactions_map = {}
+
+        for staff in staff_list:
+            fb_name = staff["facebook_name"]
+            if random.random() < rate:
+                engaged_staff.append(staff["name"])
+                fb_engaged_set.add(fb_name)
+                reactions_map[fb_name] = random.choice(possible_reacts)
+            else:
+                missed_staff.append(staff["name"])
+
+        engaged_staff.sort()
+        missed_staff.sort()
+
+        engagement_data[post["post_id"]] = {
+            "engaged_names": engaged_staff,
+            "missed_names": missed_staff,
+            "fb_engaged_set": fb_engaged_set,
+            "reactions": reactions_map,
+            "commenters_set": set(),
+            "commenters": []
+        }
+
+    return engagement_data
 
 def generate_report(staff_list, posts_list, engagement_data, is_demo):
     """
@@ -201,7 +326,7 @@ def generate_report(staff_list, posts_list, engagement_data, is_demo):
     # Header columns
     summary_headers = [
         "Date", "Post Title", "Post Link", "Total Staff", 
-        "✅ Reacted", "❌ Not Reacted", "Who Reacted", "Who Did NOT React"
+        "✅ Reacted", "❌ Not Reacted", "Reaction Details", "Who Reacted", "Who Commented", "Who Did NOT React"
     ]
     
     # Set header row height
@@ -230,7 +355,7 @@ def generate_report(staff_list, posts_list, engagement_data, is_demo):
         row_fill = alt_row_fill if row_idx % 2 == 0 else white_fill
         
         # Date
-        c_date = ws_summary.cell(row=row_idx, column=1, value=post["date"])
+        c_date = ws_summary.cell(row=row_idx, column=1, value=post.get("date", datetime.date.today().isoformat()))
         c_date.alignment = align_center
         
         # Title
@@ -238,9 +363,12 @@ def generate_report(staff_list, posts_list, engagement_data, is_demo):
         c_title.alignment = align_left
         
         # Link
-        c_link = ws_summary.cell(row=row_idx, column=3, value=post["link"])
-        c_link.hyperlink = post["link"]
-        c_link.font = link_font
+        c_link = ws_summary.cell(row=row_idx, column=3, value=post.get("link", ""))
+        if post.get("link"):
+            c_link.hyperlink = post["link"]
+            c_link.font = link_font
+        else:
+            c_link.font = data_font
         c_link.alignment = align_left
         
         # Total Staff
@@ -258,19 +386,38 @@ def generate_report(staff_list, posts_list, engagement_data, is_demo):
         c_not_reacted.font = not_reacted_font
         c_not_reacted.fill = not_reacted_fill
         c_not_reacted.alignment = align_center
+
+        # Reaction Details (name:reaction)
+        reactions_map = post_eng.get("reactions", {})
+        reaction_details = []
+        for staff in staff_list:
+            fb_name = staff.get("facebook_name")
+            if fb_name in reactions_map:
+                reaction = reactions_map[fb_name]
+                reaction_details.append(f"{staff.get('name')} ({reaction})")
+        reaction_details_str = ", ".join(reaction_details)
+        c_reaction_details = ws_summary.cell(row=row_idx, column=7, value=reaction_details_str)
+        c_reaction_details.alignment = align_left
         
         # Who Reacted (Comma-separated)
         who_reacted_str = ", ".join(engaged_names)
-        c_who_r = ws_summary.cell(row=row_idx, column=7, value=who_reacted_str)
+        c_who_r = ws_summary.cell(row=row_idx, column=8, value=who_reacted_str)
         c_who_r.alignment = align_left
-        
+
+        # Who Commented (Comma-separated)
+        commenters = post_eng.get("commenters_set", set())
+        commenters_list = sorted(list(commenters)) if commenters else []
+        who_commented_str = ", ".join(commenters_list)
+        c_who_c = ws_summary.cell(row=row_idx, column=9, value=who_commented_str)
+        c_who_c.alignment = align_left
+
         # Who Did NOT React (Comma-separated)
         who_not_reacted_str = ", ".join(missed_names)
-        c_who_nr = ws_summary.cell(row=row_idx, column=8, value=who_not_reacted_str)
+        c_who_nr = ws_summary.cell(row=row_idx, column=10, value=who_not_reacted_str)
         c_who_nr.alignment = align_left
         
         # Set shared properties per cell in the row
-        for col_idx in range(1, 9):
+        for col_idx in range(1, 10):
             cell = ws_summary.cell(row=row_idx, column=col_idx)
             cell.border = thin_border
             if col_idx not in [5, 6]:  # Don't overwrite the specialized green/red fills
@@ -294,8 +441,8 @@ def generate_report(staff_list, posts_list, engagement_data, is_demo):
                         max_len = len(line)
         # Give safety padding
         width = max(max_len + 3, 12)
-        # Cap "Who Reacted" and "Who Did NOT React" to prevent insanely wide columns
-        if col_letter in ["G", "H"]:
+        # Cap "Reaction Details", "Who Reacted" and "Who Did NOT React" to prevent insanely wide columns
+        if col_letter in ["G", "H", "I"]:
             width = 45
         elif col_letter == "B": # Title column
             width = min(width, 40)
@@ -360,16 +507,24 @@ def generate_report(staff_list, posts_list, engagement_data, is_demo):
             post_id = post["post_id"]
             post_eng = engagement_data.get(post_id, {})
             
-            # Check if this staff member is in the engaged set
-            is_engaged = fb_name in post_eng.get("fb_engaged_set", set())
-            
+            # Check engagement by reactions and comments
+            engaged = fb_name in post_eng.get("fb_engaged_set", set())
+            commented = normalize_name(fb_name) in post_eng.get("commenters_set", set())
+
             col_pos = 3 + post_idx
-            status_text = "✅ Reacted" if is_engaged else "❌ Not Reacted"
+            if engaged and commented:
+                status_text = "✅+💬"
+            elif engaged:
+                status_text = "✅ Reacted"
+            elif commented:
+                status_text = "💬 Commented"
+            else:
+                status_text = "❌ Not Reacted"
             cell = ws_breakdown.cell(row=row_idx, column=col_pos, value=status_text)
             cell.alignment = align_center
             cell.border = thin_border
             
-            if is_engaged:
+            if engaged or commented:
                 cell.font = reacted_font
                 cell.fill = reacted_fill
                 total_engaged += 1
@@ -431,90 +586,118 @@ def run():
     print()
     
     # Detect mode
-    fb_token = os.getenv("FB_ACCESS_TOKEN")
+    fb_token = os.getenv("FB_ACCESS_TOKEN", "")
+    fb_token = fb_token.strip()
     is_demo = False
     
-    if not fb_token or fb_token.strip() == "" or fb_token == "your_facebook_page_access_token_here":
+    if not fb_token or fb_token == "your_facebook_page_access_token_here":
         is_demo = True
         print("⚠️  Running in DEMO MODE — add FB token to .env for live data\n")
-        # Initialize seed for reproducible demo generation
-        random.seed(42)
+
+    if not is_demo:
+        print("🔎 Validating Facebook access token...")
+        tv = validate_facebook_token(fb_token)
+        if not tv.get("ok"):
+            print(f"\n🚫 Facebook token validation failed: {tv.get('error')}")
+            print("   Switching to DEMO MODE — ensure FB_ACCESS_TOKEN is a valid Page Access Token with pages_read_engagement/pages_show_list scopes.\n")
+            is_demo = True
+        else:
+            me = tv.get("data", {}).get("me", {})
+            pages = tv.get("data", {}).get("pages", [])
+            print(f"  ✅ Token valid for user: {me.get('name', '(unknown)')} (id: {me.get('id', '')})")
+            if isinstance(pages, list):
+                if len(pages) == 0:
+                    print("  ⚠️  No pages available from this token. To fetch Page reactions, obtain a Page Access Token via /me/accounts.")
+                    is_demo = True
+                else:
+                    print(f"  📄 {len(pages)} page(s) accessible. Prefer using a Page Access Token for live fetches.")
+            else:
+                # pages may be an error dict. This commonly happens when the provided token
+                # is already a Page Access Token (pages cannot be listed from a page token).
+                if isinstance(pages, dict) and pages.get('error'):
+                    # If the token's /me id matches one of the page ids in posts.json,
+                    # treat this as a valid Page Access Token and continue with live fetches.
+                    try:
+                        post_page_ids = {str(p.split('_', 1)[0]) for p in [pp.get('post_id','') for pp in load_json_files()[1]] if p}
+                    except Exception:
+                        post_page_ids = set()
+                    me_id = str(me.get('id', ''))
+                    if me_id and me_id in post_page_ids:
+                        print(f"  ✅ Token appears to be a Page Access Token for page id {me_id}; proceeding with live fetches.")
+                    else:
+                        print(f"  ⚠️  Could not list pages: {pages.get('error')}")
+                        is_demo = True
     
     engagement_data = {}
-    
-    for i, post in enumerate(posts_list):
-        post_title = post["title"]
-        post_id = post["post_id"]
-        print(f"  📡  Fetching: {post_title}")
-        
-        if is_demo:
-            # Simulate slight processing delay for a premium interactive feel
-            time.sleep(0.4)
-            
-            # Seed-reproducible random staff engagement selection
-            # We vary engagement rates per post to make data realistic and dynamic
-            rates = [0.28, 0.19, 0.36, 0.22, 0.31]
-            rate = rates[i % len(rates)]
-            
-            # Select random subset of staff who engaged
-            engaged_staff = []
-            missed_staff = []
-            fb_engaged_set = set()
-            
-            for staff in staff_list:
-                # We determine if staff engaged.
-                # In demo mode, a person is engaged if they reacted OR commented.
-                # We draw a single random threshold for engagement.
-                if random.random() < rate:
-                    engaged_staff.append(staff["name"])
-                    fb_engaged_set.add(staff["facebook_name"])
-                else:
-                    missed_staff.append(staff["name"])
-                    
-            # Sort lists alphabetically for a clean premium presentation
-            engaged_staff.sort()
-            missed_staff.sort()
-            
-            engagement_data[post_id] = {
-                "engaged_names": engaged_staff,
-                "missed_names": missed_staff,
-                "fb_engaged_set": fb_engaged_set
-            }
-            
-        else:
-            # Live mode using Facebook Graph API
+    live_fetch_failures = 0
+
+    if is_demo:
+        engagement_data = build_demo_engagement(staff_list, posts_list)
+    else:
+        for post in posts_list:
+            post_title = post["title"]
+            post_id = post["post_id"]
+            print(f"  📡  Fetching: {post_title}")
             reactors = get_facebook_reactions(post_id, fb_token)
-            comments = get_facebook_comments(post_id, fb_token)
-            
-            # If either API call failed completely (returned None), skip post
-            if reactors is None or comments is None:
+            if reactors is None:
                 print(f"  ⚠️  Skipping post '{post_title}' due to fetching error.")
+                live_fetch_failures += 1
                 continue
-                
-            # Union of both names to get total engaged facebook names
-            live_engaged_fb_names = reactors.union(comments)
-            
+            if reactors.get("auth_error"):
+                print("\n🚫 Facebook access token invalid or expired.")
+                print("   Update .env with a fresh FB_ACCESS_TOKEN and rerun the tracker.")
+                return
+            if reactors.get("unsupported_error"):
+                print("\n🚫 Facebook Graph API unsupported request or missing permissions detected.")
+                print("   Confirm the token belongs to the page that owns these posts and has pages_read_engagement/pages_show_list.")
+                live_fetch_failures += 1
+                continue
+
             engaged_staff = []
             missed_staff = []
             fb_engaged_set = set()
-            
-            # Filter and match staff
+            reactions_map = {}
+
+            # Determine reaction engagement based on reactors dict keys (normalized lowercase)
             for staff in staff_list:
-                fb_name = staff["facebook_name"]
-                if fb_name in live_engaged_fb_names:
-                    engaged_staff.append(staff["name"])
-                    fb_engaged_set.add(fb_name)
+                fb_name = staff["facebook_name"].strip()
+                matched_key = find_best_reactor_match(fb_name, reactors)
+                if matched_key:
+                    engaged_staff.append(staff["name"])  # display name
+                    fb_engaged_set.add(staff.get("facebook_name"))
+                    reactions_map[staff.get("facebook_name")] = reactors[matched_key]["type"]
+                    if normalize_name(staff.get("facebook_name")) != matched_key:
+                        print(f"    🔎 Fuzzy matched '{staff.get('facebook_name')}' -> '{reactors[matched_key]['original']}' (ratio/substring)")
                 else:
-                    missed_staff.append(staff["name"])
-                    
+                    missed_staff.append(staff["name"])  # name for display
+                    print(f"    ⚠️  No match for staff: '{fb_name}'")
+
             engaged_staff.sort()
             missed_staff.sort()
-            
+
             engagement_data[post_id] = {
                 "engaged_names": engaged_staff,
                 "missed_names": missed_staff,
-                "fb_engaged_set": fb_engaged_set
+                "fb_engaged_set": fb_engaged_set,
+                "reactions": reactions_map
             }
+            # attempt to fetch commenters for the post
+            comments = get_facebook_comments(post_id, fb_token)
+            if comments is None:
+                commenters_list = []
+                commenters_set_norm = set()
+            else:
+                commenters_list = sorted(list(comments))
+                commenters_set_norm = {normalize_name(n) for n in comments}
+
+            engagement_data[post_id]["commenters"] = commenters_list
+            engagement_data[post_id]["commenters_set"] = commenters_set_norm
+
+        if live_fetch_failures == len(posts_list):
+            print("\n⚠️  All live fetches failed due to unsupported request or missing permissions.")
+            print("   Switching to DEMO MODE to generate a placeholder report.")
+            is_demo = True
+            engagement_data = build_demo_engagement(staff_list, posts_list)
             
     # Generate the highly styled Excel report
     try:
