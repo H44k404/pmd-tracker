@@ -164,11 +164,13 @@ def get_facebook_reactions(post_id, access_token):
     reactors = {}  # key: normalized name, value: (original_name, reaction_type)
     url = f"https://graph.facebook.com/v19.0/{post_id}/reactions"
     params = {
-        "fields": "name,type",
+        "fields": "id,name,type",
         "access_token": access_token,
         "limit": 500
     }
+    attempts = 0
     while url:
+        attempts += 1
         try:
             response = requests.get(url, params=params if url.endswith("/reactions") else None, timeout=30)
             if response.status_code != 200:
@@ -183,15 +185,20 @@ def get_facebook_reactions(post_id, access_token):
                 return None
             data = response.json()
             for item in data.get("data", []):
-                name = item.get("name", "").strip()
+                name = item.get("name", "")
                 r_type = item.get("type") or "UNKNOWN"
+                rid = item.get("id")
                 if name:
                     # Store with normalized key for case-insensitive matching
-                    reactors[normalize_name(name)] = {"original": name, "type": r_type}
+                    reactors[normalize_name(name)] = {"original": name, "type": r_type, "id": rid}
             url = data.get("paging", {}).get("next")
             params = None
         except Exception as e:
             print(f"\n  ❌  Exception while fetching reactions for post {post_id}: {e}")
+            # retry a couple times
+            if attempts < 3:
+                time.sleep(1)
+                continue
             return None
     print(f"    ℹ️  Total reactors found: {len(reactors)}")
     return reactors
@@ -205,12 +212,14 @@ def get_facebook_comments(post_id, access_token):
     commentators = set()
     url = f"https://graph.facebook.com/v19.0/{post_id}/comments"
     params = {
-        "fields": "from{name}",
+        "fields": "from{id,name}",
         "access_token": access_token,
         "limit": 500
     }
-    
+    attempts = 0
+
     while url:
+        attempts += 1
         try:
             response = requests.get(
                 url, 
@@ -221,6 +230,9 @@ def get_facebook_comments(post_id, access_token):
             if response.status_code != 200:
                 error_msg = response.json().get("error", {}).get("message", "Unknown error")
                 print(f"\n  ❌ Facebook Graph API Error (Comments for post {post_id}): {error_msg}")
+                if attempts < 3:
+                    time.sleep(1)
+                    continue
                 return None
                 
             data = response.json()
@@ -231,6 +243,10 @@ def get_facebook_comments(post_id, access_token):
                     name = from_user.get("name")
                     if name:
                         commentators.add(name)
+                    # also handle id if available via extended matching
+                    uid = from_user.get('id')
+                    if uid:
+                        commentators.add(str(uid))
                         
             # Get next page URL
             url = data.get("paging", {}).get("next")
@@ -238,6 +254,9 @@ def get_facebook_comments(post_id, access_token):
             
         except Exception as e:
             print(f"\n  ❌ Exception while fetching comments for post {post_id}: {e}")
+            if attempts < 3:
+                time.sleep(1)
+                continue
             return None
             
     return commentators
@@ -628,6 +647,16 @@ def run():
                         print(f"  ⚠️  Could not list pages: {pages.get('error')}")
                         is_demo = True
     
+    # Load manual overrides if present
+    overrides = {}
+    overrides_path = 'overrides.json'
+    if os.path.exists(overrides_path):
+        try:
+            with open(overrides_path, 'r', encoding='utf-8') as f:
+                overrides = json.load(f)
+        except Exception:
+            overrides = {}
+
     engagement_data = {}
     live_fetch_failures = 0
 
@@ -638,6 +667,7 @@ def run():
             post_title = post["title"]
             post_id = post["post_id"]
             print(f"  📡  Fetching: {post_title}")
+            # fetch reactors and commenters with retries and snapshot
             reactors = get_facebook_reactions(post_id, fb_token)
             if reactors is None:
                 print(f"  ⚠️  Skipping post '{post_title}' due to fetching error.")
@@ -658,9 +688,70 @@ def run():
             fb_engaged_set = set()
             reactions_map = {}
 
+            # fetch commenters and normalized commenter set
+            commenters = set()
+            commenters_id_set = set()
+            if 'commenters' in post.get('post_id', ''):
+                pass
+            comments_raw = get_facebook_comments(post_id, fb_token)
+            if isinstance(comments_raw, set):
+                for c in comments_raw:
+                    # comments_raw may contain names and ids (ids are numeric strings)
+                    if c and c.isdigit():
+                        commenters_id_set.add(c)
+                    elif c:
+                        commenters.add(c)
+            # normalized commenters set for matching
+            commenters_norm_set = {normalize_name(n) for n in commenters}
+
             # Determine reaction engagement based on reactors dict keys (normalized lowercase)
             for staff in staff_list:
                 fb_name = staff["facebook_name"].strip()
+                staff_fb_id = str(staff.get('facebook_id')) if staff.get('facebook_id') else None
+
+                # 1) check manual overrides for this post
+                over = overrides.get(post_id, {}).get(staff.get('name'))
+                if over:
+                    # apply override flags
+                    if over.get('reacted'):
+                        engaged_staff.append(staff['name'])
+                        fb_engaged_set.add(staff.get('facebook_name'))
+                        reactions_map[staff.get('facebook_name')] = over.get('reaction','(override)')
+                        continue
+                    if over.get('commented'):
+                        # mark as commented (counted as engaged)
+                        missed_staff.append(staff['name'])
+                        # we'll reflect in commenters set below
+                        continue
+
+                # 2) match by facebook_id if provided
+                matched = False
+                if staff_fb_id:
+                    # reactors may include id values in their dicts
+                    for rnorm, rdata in reactors.items():
+                        if rdata.get('id') and str(rdata.get('id')) == staff_fb_id:
+                            engaged_staff.append(staff['name'])
+                            fb_engaged_set.add(staff.get('facebook_name'))
+                            reactions_map[staff.get('facebook_name')] = rdata.get('type')
+                            matched = True
+                            break
+                    if matched:
+                        continue
+
+                # 3) match by commenters id/name
+                if staff_fb_id and staff_fb_id in commenters_id_set:
+                    engaged_staff.append(staff['name'])
+                    fb_engaged_set.add(staff.get('facebook_name'))
+                    matched = True
+                    continue
+
+                if normalize_name(fb_name) in commenters_norm_set:
+                    engaged_staff.append(staff['name'])
+                    fb_engaged_set.add(staff.get('facebook_name'))
+                    matched = True
+                    continue
+
+                # 4) match by reactors name using fuzzy matching
                 matched_key = find_best_reactor_match(fb_name, reactors)
                 if matched_key:
                     engaged_staff.append(staff["name"])  # display name
@@ -670,6 +761,7 @@ def run():
                         print(f"    🔎 Fuzzy matched '{staff.get('facebook_name')}' -> '{reactors[matched_key]['original']}' (ratio/substring)")
                 else:
                     missed_staff.append(staff["name"])  # name for display
+                    # print no-match only for debugging
                     print(f"    ⚠️  No match for staff: '{fb_name}'")
 
             engaged_staff.sort()
@@ -679,7 +771,9 @@ def run():
                 "engaged_names": engaged_staff,
                 "missed_names": missed_staff,
                 "fb_engaged_set": fb_engaged_set,
-                "reactions": reactions_map
+                "reactions": reactions_map,
+                "commenters": sorted(list(commenters)),
+                "commenters_set": commenters_norm_set
             }
             # attempt to fetch commenters for the post
             comments = get_facebook_comments(post_id, fb_token)

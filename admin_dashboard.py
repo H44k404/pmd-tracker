@@ -175,6 +175,19 @@ class PMDAdminDashboard:
         )
         self.btn_run_tracker.pack(side=tk.LEFT, padx=5)
         
+        btn_overrides = tk.Button(
+            right_section,
+            text="⚙️ Overrides",
+            font=("Arial", 10, "bold"),
+            bg="#FF9800",
+            fg=COLOR_WHITE,
+            padx=15,
+            pady=8,
+            cursor="hand2",
+            command=self.open_overrides_manager
+        )
+        btn_overrides.pack(side=tk.LEFT, padx=5)
+        
         btn_refresh = tk.Button(
             right_section,
             text="🔄 Refresh",
@@ -661,6 +674,151 @@ class PMDAdminDashboard:
         """Clears search box and resets table filters."""
         self.ent_search.delete(0, tk.END)
         self.refresh_table()
+
+    def open_overrides_manager(self):
+        """Opens a modal window to manage manual engagement overrides."""
+        overrides_window = tk.Toplevel(self.root)
+        overrides_window.title("Manage Engagement Overrides")
+        overrides_window.geometry("700x500")
+        
+        # Instructions
+        lbl_info = tk.Label(
+            overrides_window,
+            text="Mark staff as reacted/commented when API fails to detect them.\nOverrides are saved in overrides.json and applied during tracker runs.",
+            font=("Arial", 10),
+            wraplength=650,
+            justify=tk.LEFT
+        )
+        lbl_info.pack(fill=tk.X, padx=15, pady=10)
+        
+        # Main form frame
+        form_frame = ttk.Frame(overrides_window, padding=10)
+        form_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(form_frame, text="Post ID:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        ent_post_id = ttk.Combobox(form_frame, values=[p.get("post_id") for p in self.posts_list], width=40)
+        ent_post_id.grid(row=0, column=1, sticky=tk.W, padx=(0, 10))
+        
+        ttk.Label(form_frame, text="Staff Name:").grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
+        ent_staff_name = ttk.Combobox(form_frame, values=[s.get("name") for s in self.staff_list], width=30)
+        ent_staff_name.grid(row=0, column=3, sticky=tk.W)
+        
+        ttk.Label(form_frame, text="Action:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(10, 0))
+        var_action = tk.StringVar(value="reacted")
+        ttk.Radiobutton(form_frame, text="Reacted", variable=var_action, value="reacted").grid(row=1, column=1, sticky=tk.W, pady=(10, 0))
+        ttk.Radiobutton(form_frame, text="Commented", variable=var_action, value="commented").grid(row=1, column=2, sticky=tk.W, pady=(10, 0))
+        
+        def add_override():
+            post_id = ent_post_id.get().strip()
+            staff_name = ent_staff_name.get().strip()
+            action = var_action.get()
+            
+            if not post_id or not staff_name:
+                messagebox.showwarning("Input Required", "Select both post and staff member.")
+                return
+            
+            # Load current overrides
+            overrides_path = 'overrides.json'
+            overrides = {}
+            if os.path.exists(overrides_path):
+                try:
+                    with open(overrides_path, 'r', encoding='utf-8') as f:
+                        overrides = json.load(f)
+                except Exception:
+                    overrides = {}
+            
+            # Add override
+            if post_id not in overrides:
+                overrides[post_id] = {}
+            
+            if action == "reacted":
+                overrides[post_id][staff_name] = {"reacted": True, "reaction": "LIKE"}
+            else:
+                overrides[post_id][staff_name] = {"commented": True}
+            
+            # Save
+            try:
+                with open(overrides_path, 'w', encoding='utf-8') as f:
+                    json.dump(overrides, f, indent=2, ensure_ascii=False)
+                messagebox.showinfo("Success", f"Override added for {staff_name} on post {post_id[:20]}...")
+                refresh_overrides_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not save override: {e}")
+        
+        btn_add = ttk.Button(form_frame, text="➕ Add Override", command=add_override)
+        btn_add.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=10, ipady=3)
+        
+        # Overrides list
+        ttk.Separator(overrides_window, orient='horizontal').pack(fill='x', padx=10, pady=5)
+        
+        ttk.Label(overrides_window, text="Current Overrides:", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=15, pady=(5, 5))
+        
+        tree_overrides = ttk.Treeview(overrides_window, columns=("post", "staff", "action"), show="headings", height=15)
+        tree_overrides.heading("post", text="Post ID", anchor=tk.W)
+        tree_overrides.heading("staff", text="Staff Name", anchor=tk.W)
+        tree_overrides.heading("action", text="Action", anchor=tk.W)
+        
+        tree_overrides.column("post", width=200, anchor=tk.W)
+        tree_overrides.column("staff", width=200, anchor=tk.W)
+        tree_overrides.column("action", width=100, anchor=tk.W)
+        
+        scrollbar = ttk.Scrollbar(overrides_window, orient=tk.VERTICAL, command=tree_overrides.yview)
+        tree_overrides.configure(yscrollcommand=scrollbar.set)
+        
+        tree_overrides.pack(fill=tk.BOTH, expand=True, side=tk.LEFT, padx=10, pady=5)
+        scrollbar.pack(fill=tk.Y, side=tk.LEFT, pady=5)
+        
+        def refresh_overrides_list():
+            for item in tree_overrides.get_children():
+                tree_overrides.delete(item)
+            
+            overrides_path = 'overrides.json'
+            if os.path.exists(overrides_path):
+                try:
+                    with open(overrides_path, 'r', encoding='utf-8') as f:
+                        overrides = json.load(f)
+                    for post_id, staff_dict in overrides.items():
+                        for staff_name, override_data in staff_dict.items():
+                            action = "Reacted" if override_data.get('reacted') else "Commented"
+                            tree_overrides.insert("", tk.END, values=(post_id[:25], staff_name, action))
+                except Exception:
+                    pass
+        
+        def delete_override():
+            selected = tree_overrides.selection()
+            if not selected:
+                messagebox.showwarning("Selection Required", "Select an override to delete.")
+                return
+            
+            values = tree_overrides.item(selected, "values")
+            post_id = values[0]
+            staff_name = values[1]
+            
+            overrides_path = 'overrides.json'
+            if os.path.exists(overrides_path):
+                try:
+                    with open(overrides_path, 'r', encoding='utf-8') as f:
+                        overrides = json.load(f)
+                    
+                    # Find full post id
+                    for full_post_id in list(overrides.keys()):
+                        if full_post_id.startswith(post_id[:25]):
+                            if staff_name in overrides[full_post_id]:
+                                del overrides[full_post_id][staff_name]
+                                if not overrides[full_post_id]:
+                                    del overrides[full_post_id]
+                    
+                    with open(overrides_path, 'w', encoding='utf-8') as f:
+                        json.dump(overrides, f, indent=2, ensure_ascii=False)
+                    messagebox.showinfo("Deleted", "Override removed.")
+                    refresh_overrides_list()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not delete: {e}")
+        
+        btn_delete = ttk.Button(overrides_window, text="❌ Delete Selected Override", command=delete_override)
+        btn_delete.pack(fill=tk.X, padx=10, pady=5, ipady=2)
+        
+        refresh_overrides_list()
 
 
 if __name__ == "__main__":

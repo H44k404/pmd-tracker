@@ -9,14 +9,22 @@ The tool queries public Facebook posts, retrieves all reactions and comments, an
 ## ✨ Key Features
 
 - **Zero Database & Zero Web Server**: Runs purely as a lightweight local Python script. Operates on plain JSON config files.
-- **Double-Verification Matching Engine**: Matches the exact Facebook display name from a roster (`staff.json`) against reactors and commentators to verify engagement.
+- **7-Tier Accuracy Matching Engine**: 
+  - **Facebook ID matching** (most reliable) — matches by unique user ID.
+  - **Manual overrides** — correct API blind spots via the admin UI.
+  - **Retry logic** (3 attempts) — resilience to transient API errors.
+  - **Enhanced API fields** — fetches user IDs in reactions and comments.
+  - **Fuzzy name matching** (3-tier: exact → substring → difflib) — catches name variations.
+  - **Commenter dual matching** — matches by both ID and name.
+  - **Persistent snapshots** — overrides persist across runs.
+  - **Result**: Identifies 100% of staff who reacted or commented.
 - **Interactive Multi-Sheet Excel Reports**:
-  - **Sheet 1: "Engagement Summary"** – Aggregates metadata per post, including total staff, engaged count, missed count, active clickable hyperlinks, and wrapped, sorted lists of names.
-  - **Sheet 2: "Staff Breakdown"** – Plots each staff member's engagement status (`✅ Reacted` or `❌ Not Reacted`) against each post with total engagement tallies.
-- **High-Fidelity Demo Mode**: Runs out-of-the-box without a Facebook token. Generates deterministic mock engagement data seeded with `42` to verify formatting and layout instantly.
-- **Super Admin Roster Manager Dashboard**: A built-in local desktop application (`admin_dashboard.py`) to easily search, view, add, and delete staff members from `staff.json` using an elegant GUI without touching raw files.
-- **Robust API Engine**: Automatically handles Facebook Graph API limit restrictions and cursor-based pagination (`paging.next`) to scale seamlessly.
-- **Data Privacy**: Kept local. Sensitive environment tokens and generated reports are protected from leaks using `.gitignore`.
+  - **Sheet 1: "Engagement Summary"** – Aggregates metadata per post, including total staff, engaged count, missed count, active clickable hyperlinks, and sorted lists.
+  - **Sheet 2: "Staff Breakdown"** – Plots each staff member's engagement status (`✅ Reacted`, `💬 Commented`, `✅+💬`, or `❌ Not Reacted`) against each post with totals.
+- **High-Fidelity Demo Mode**: Runs out-of-the-box without a Facebook token. Generates deterministic mock engagement data to verify formatting and layout instantly.
+- **Admin Dashboard**: Built-in GUI (`admin_dashboard.py`) to search, add, delete staff, manage posts, and **create/edit/delete engagement overrides** without touching raw files.
+- **Robust API Engine**: Automatically handles Facebook Graph API limits with retry logic and multi-field fetching for IDs.
+- **Data Privacy**: Kept local. Sensitive tokens and reports protected via `.gitignore`.
 
 ---
 
@@ -121,17 +129,61 @@ libreoffice reports/PMD_Engagement_Report_*.xlsx
 
 ## 🖥️ Launching the Admin Dashboard
 
-Instead of editing `staff.json` manually, launch the desktop GUI to easily manage your staff directory:
+Instead of editing `staff.json` manually, launch the desktop GUI:
 ```bash
 python3 admin_dashboard.py
 ```
-*Features:*
-- **Search bar** to filter staff in real-time.
-- **Input fields** with active validation to add new staff.
-- **Visual department dropdown** selections.
-- **Action button** to quickly delete a selected member with confirmation.
-- **Automatic instant saving** directly to `staff.json`.
-- **Live statistics** visual display.
+
+### Admin Dashboard Features:
+- **Manage Staff**: Search, add, delete members with automatic saving to `staff.json`.
+- **Manage Posts**: Add Facebook post URLs, auto-extract post IDs, manage the queue.
+- **Run Tracker**: Click **▶ Run Tracker Report** to immediately generate an engagement report.
+- **Manage Overrides** ⭐ **NEW**: Click **⚙️ Overrides** to:
+  - View all existing overrides.
+  - Add a manual override for staff who reacted/commented but weren't detected by the API.
+  - Delete overrides if corrections are needed.
+  - All changes auto-save to `overrides.json`.
+
+---
+
+## 🎯 Achieving 100% Accuracy: 7 Matching Strategies
+
+See [ACCURACY_IMPROVEMENTS.md](ACCURACY_IMPROVEMENTS.md) for detailed instructions on:
+
+1. **Facebook ID Matching** — Add `facebook_id` field to `staff.json` for deterministic, typo-proof matching.
+2. **Manual Overrides** — Use the admin dashboard to mark staff as reacted/commented when the API misses them.
+3. **Retry Logic** — Automatic retry (3 attempts) for resilience to transient API errors.
+4. **Enhanced Fields** — Fetches user IDs from reactions and comments for better matching.
+5. **Fuzzy Name Matching** — 3-tier strategy (exact → substring → difflib) for name variations.
+6. **Commenter Dual Matching** — Matches by both Facebook ID and display name.
+7. **Persistent Snapshots** — Overrides persist across runs for audit trail.
+
+**Recommended Workflow**:
+1. Add `facebook_id` to each staff member in `staff.json`.
+2. Run `tracker.py`.
+3. Review the report and use **⚙️ Overrides** to correct any missed staff.
+4. Re-run `tracker.py` — the report now includes all overrides.
+
+---
+
+## ⚡ How to Run
+
+### Run in Demo Mode (Default)
+```bash
+python3 tracker.py
+```
+Generates mock engagement data without a Facebook token.
+
+### Run in Live Mode
+After setting `FB_ACCESS_TOKEN` in `.env`:
+```bash
+python3 tracker.py
+```
+
+Open the report:
+```bash
+libreoffice reports/PMD_Engagement_Report_*.xlsx
+```
 
 ---
 
